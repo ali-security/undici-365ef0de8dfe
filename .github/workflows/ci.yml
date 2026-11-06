@@ -1,21 +1,16 @@
 name: CI
 
 on:
-  push:
-    branches:
-     - main
-     - current
-     - next
-     - 'v*'
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   dependency-review:
-    if: ${{ github.event_name == 'pull_request' }}
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -33,6 +28,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -54,19 +50,431 @@ jobs:
         run: npm run lint
 
   test:
-    name: Test ${{ matrix.node-version == '24' && matrix.runs-on == 'ubuntu-latest' && 'and Coverage ' || ''}}with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }}
+    name: Test with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       max-parallel: 0
       matrix:
         node-version: ['22', '24', '25', '26']
         runs-on: ['ubuntu-latest', 'windows-latest', 'macos-latest']
-    uses: ./.github/workflows/nodejs.yml
-    with:
-      codecov: ${{ (matrix.node-version == '24' || matrix.node-version == '25' || matrix.node-version == '26') && matrix.runs-on == 'ubuntu-latest' }}
-      node-version: ${{ matrix.node-version }}
-      runs-on: ${{ matrix.runs-on }}
-    secrets: inherit
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ 30 }}
+    steps:
+      # SEAL: the WPT submodule (third_party/test262) has paths longer than
+      # MAX_PATH; without core.longpaths the recursive submodule checkout fails
+      # on windows-latest with "Filename too long".
+      - name: Enable git long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - name: Checkout Repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Node.js@${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Print version information
+        run: |
+          echo OS: $(node -p "os.version()")
+          echo Node.js: $(node --version)
+          echo "Node.js built-in dependencies: $(node -p "'\r\n' + (Object.entries(process.versions).map(([k, v], i, arr) => (i !== arr.length - 1 ? '├──' : '└──') + k + '@' + v)).join('\r\n')")"
+          echo npm: $(npm --version)
+          echo git: $(git --version)
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure hosts file for WPT (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd ${{ github.workspace }}\test\web-platform-tests\wpt
+          python wpt make-hosts-file | Out-File $env:SystemRoot\System32\drivers\etc\hosts -Encoding ascii -Append
+        shell: powershell
+
+      # SEAL: backported from upstream main. The macOS runner image now ships
+      # Python 3.15, which removed http.server.CGIHTTPRequestHandler;
+      # pywebsocket3, used by the WPT server, still needs it.
+      - name: Setup Python (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Configure hosts file for WPT (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd ${{ github.workspace }}/test/web-platform-tests/wpt
+          python3 wpt make-hosts-file | sudo tee -a /etc/hosts
+
+      # SEAL: test/interceptors/dns.js runs its IPv6 cases only when localhost
+      # resolves to ::1; make sure the Linux runner's hosts file maps it.
+      - name: Map localhost to ::1 (Linux)
+        if: runner.os == 'Linux'
+        run: grep -Eq '^::1[[:space:]].*[[:space:]]localhost([[:space:]]|$)' /etc/hosts || echo '::1 localhost' | sudo tee -a /etc/hosts
+
+      - name: Generate PEM files
+        run: npm run generate-pem
+        id: generate-pem
+
+      - name: Test unit
+        run: npm run test:unit 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-unit
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test node-test
+        run: npm run test:node-test 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-node-test
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test fetch
+        run: npm run test:fetch 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-fetch
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test node-fetch
+        run: npm run test:node-fetch 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-node-fetch
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test cache
+        run: npm run test:cache 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test cache-interceptor with sqlite
+        run: npm run test:cache-interceptor 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache-interceptor
+        env:
+          CI: true
+          NODE_OPTIONS: --experimental-sqlite
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test cache-tests
+        run: npm run test:cache-tests 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache-tests
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test cookies
+        run: npm run test:cookies 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cookies
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test interceptors
+        run: npm run test:interceptors 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-interceptors
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test eventsource
+        run: npm run test:eventsource 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-eventsource
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test infra
+        run: npm run test:infra 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-infra
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test subresource-integrity
+        run: npm run test:subresource-integrity 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-subresource-integrity
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test websocket
+        run: npm run test:websocket 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-websocket
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test jest
+        run: npm run test:jest 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-jest
+        env:
+          CI: true
+          NODE_V8_COVERAGE: ''
+          UNDICI_NO_WASM_SIMD: ''
+
+      - name: Test wpt
+        run: npm run test:wpt 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-wpt
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: ''
+
+      # SEAL: upstream's own WPT gate (wpt-runner.mjs) builds its jsondiff with
+      # propertyFilter name === 'success', which also filters out the directory
+      # keys, so the diff is always empty and the step can never fail. This step
+      # performs the comparison the gate intends: every subtest result the run
+      # just wrote into expectation.json is checked against the committed copy,
+      # each failing subtest is classified, and the job fails on any regression.
+      - name: Check WPT results against upstream expectation.json
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-wpt-report.mjs" <<'SEAL_EOF'
+          import { execFileSync } from 'node:child_process'
+          import { readFileSync } from 'node:fs'
+          const P = 'test/web-platform-tests/expectation.json'
+          const before = JSON.parse(execFileSync('git', ['show', `HEAD:${P}`], { maxBuffer: 512 * 1024 * 1024, encoding: 'utf8' }))
+          const after = JSON.parse(readFileSync(P, 'utf8'))
+          const major = Number(process.versions.node.split('.')[0])
+          // Subtests excluded on one runtime/platform only, each measured on every leg of the fork run.
+          const KNOWN_CASES = [
+            ['not applicable on Node.js < 24: the test body itself constructs a Float16Array, which Node.js 22 does not have (ReferenceError in the test, before undici is called); passes on Node.js 24/25/26',
+              (path, c) => typeof Float16Array === 'undefined' && /Float16Array is not defined/.test(c.message ?? '')],
+            ['Windows-only timing assertion: the tentative WebSocketStream test expects the TLS send to be held back >= 1800 ms, Windows completes it in ~20-32 ms on every Node.js version; passes on every Linux and macOS leg',
+              (path) => process.platform === 'win32' && path === '/websockets/stream/tentative/backpressure-send.any.html?wss']
+          ]
+          const KNOWN_FILES = [
+            ['not applicable on Node.js >= 26: this window-only test file aborts in its own harness setup with "document is not defined" before any subtest runs; loads and passes on Node.js 22/24/25',
+              (path) => major >= 26 && path === '/fetch/api/response/response-body-read-task-handling.html']
+          ]
+          const isFile = (v) => v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.cases)
+          const get = (root, segs) => segs.reduce((o, s) => (o && typeof o === 'object' ? o[s] : undefined), root)
+          // .sub tests embed the WPT server's randomly assigned alternate port (>= 10000) in subtest names.
+          const norm = (name) => name.replace(/(web-platform\.test|127\.0\.0\.1|localhost):(\d{5})\b/g, '$1:<port>')
+          const short = (m) => (m ? ` — ${String(m).replace(/\s+/g, ' ').slice(0, 160)}` : '')
+          const n = { files: 0, untrackedFiles: 0, pass: 0, expectedFail: 0, expectedFailFile: 0, flaky: 0, fixed: 0 }
+          const regressions = []
+          const known = []
+          const fileRegressions = []
+          const untracked = []
+          const unrecorded = []
+          const visit = (file, segs) => {
+            n.files++
+            const path = '/' + segs.join('/')
+            const b = get(before, segs)
+            if (!isFile(b)) {
+              n.untrackedFiles++
+              const fails = file.cases.filter((c) => !c.success && !c.flaky)
+              n.pass += file.cases.length - fails.length
+              if (fails.length) untracked.push(`${path}: ${fails.length} of ${file.cases.length} subtests failed (e.g. "${fails[0].name}"${short(fails[0].message)})`)
+              else if (file.success === false) untracked.push(`${path}: test file failed to load`)
+              return
+            }
+            if (b.success === true && file.success === false) {
+              const k = KNOWN_FILES.find(([, m]) => m(path))
+              if (k) known.push(`EXCLUDED ${path} (whole file) — ${k[0]}`)
+              else fileRegressions.push(path)
+            }
+            for (const c of file.cases) {
+              if (c.flaky) { n.flaky++; continue }
+              const bc = b.cases.find((x) => x.name === c.name) ?? b.cases.find((x) => norm(x.name) === norm(c.name))
+              if (c.success) { n.pass++; if (bc && bc.success === false) n.fixed++; continue }
+              if (bc?.flaky) { n.flaky++; continue }
+              if (bc && bc.success === false) { n.expectedFail++; continue }
+              if (!bc && b.success !== true) { n.expectedFailFile++; continue }
+              const k = KNOWN_CASES.find(([, m]) => m(path, c))
+              if (k) { known.push(`EXCLUDED ${path} :: "${c.name}" — ${k[0]}`); continue }
+              if (bc) regressions.push(`${path} :: "${c.name}"${short(c.message)}`)
+              else unrecorded.push(`${path} :: "${c.name}"${short(c.message)}`)
+            }
+          }
+          const walk = (node, segs) => {
+            for (const [k, v] of Object.entries(node)) {
+              if (isFile(v)) visit(v, [...segs, k])
+              else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, [...segs, k])
+            }
+          }
+          walk(after, [])
+          console.log('')
+          const untrackedFails = untracked.reduce((a, l) => a + (Number(l.match(/: (\d+) of/)?.[1]) || 0), 0)
+          console.log('WPT subtest results compared with upstream test/web-platform-tests/expectation.json (as committed at HEAD):')
+          console.log(`  test files with results: ${n.files} (${n.files - n.untrackedFiles} tracked in expectation.json, ${n.untrackedFiles} not tracked)`)
+          console.log(`  subtests passed: ${n.pass} (${n.fixed} of them recorded upstream as failing)`)
+          console.log(`  subtests failed that upstream records as expected failures (success:false): ${n.expectedFail}`)
+          console.log(`  subtests failed in files upstream records as failing to load: ${n.expectedFailFile}`)
+          console.log(`  subtests marked flaky upstream (result not asserted upstream either): ${n.flaky}`)
+          console.log(`  subtests excluded on this runtime/platform only (each with its reason): ${known.length}`)
+          known.forEach((r) => console.log(`    ${r}`))
+          console.log(`  REGRESSIONS (recorded passing upstream, failed here): ${regressions.length}`)
+          regressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FILE REGRESSIONS (recorded as loading upstream, failed to load here): ${fileRegressions.length}`)
+          fileRegressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FAILED subtests missing from the baseline of a tracked file: ${unrecorded.length}`)
+          unrecorded.forEach((r) => console.log(`    ${r}`))
+          console.log(`  files the WPT checkout contains but upstream's expectation.json has no entry for (no baseline to compare; ${untrackedFails} failing subtests, browser-only or tentative APIs):`)
+          untracked.forEach((r) => console.log(`    ${r}`))
+          if (regressions.length || fileRegressions.length || unrecorded.length) {
+            console.log('WPT gate: FAILED — results diverge from upstream expectation.json (listed above).')
+            process.exitCode = 1
+          } else {
+            console.log(`WPT gate: PASSED — ${n.pass} subtests passed; all ${n.expectedFail + n.expectedFailFile} failures in tracked files are expected failures recorded upstream, ${known.length} excluded on this runtime/platform (reasons listed), no regressions.`)
+          }
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-wpt-report.mjs" 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+
+      # SEAL: print, at the end of the job log, every suite's pass/fail/skip
+      # counts (parsed from the test output captured above with tee) and each
+      # skip that actually fired, with the skip condition from the test source.
+      - name: Test results summary and fired skips with reasons
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-test-summary.mjs" <<'SEAL_EOF'
+          import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+          import { join } from 'node:path'
+          const out = process.argv[2]
+          if (!existsSync(out)) { console.log(`no captured test output at ${out}`); process.exit(1) }
+          const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, '')
+          const log = strip(readFileSync(out, 'utf8')).split(/\r?\n/)
+          // ---- index of skip declarations in the test sources (to give each fired skip its reason)
+          const skipDirs = new Set(['fixtures', 'web-platform-tests', 'fuzzing', 'autobahn', 'types', 'imports'])
+          const files = []
+          const walk = (d) => readdirSync(d).sort().forEach((e) => {
+            const p = join(d, e)
+            if (statSync(p).isDirectory()) { if (!skipDirs.has(e)) walk(p) } else if (/\.[cm]?js$/.test(e)) files.push(p)
+          })
+          walk('test')
+          const nameRe = /^\s*(?:await\s+)?(?:test|it|describe)(?:\.skip)?\(\s*(['"`])((?:\\.|(?!\1).)*)\1/
+          const known = new Set(['process', 'require', 'Number', 'true', 'false', 'typeof', 'undefined', 'null'])
+          const sites = new Map()
+          const addSite = (name, text) => { if (!sites.has(name)) sites.set(name, []); sites.get(name).push(text) }
+          const siteFor = (name) => sites.get(name) ?? [...sites].find(([k]) => k.includes('${') && new RegExp('^' + k.split(/\$\{[^}]*\}/).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.+') + '$').test(name))?.[1]
+          for (const f of files) {
+            const lines = readFileSync(f, 'utf8').split('\n')
+            const defOf = (id) => {
+              const i = lines.findIndex((x) => new RegExp(`^\\s*(?:const|let|var)\\s+${id}\\s*=`).test(x))
+              if (i === -1) return ''
+              let def = lines[i].trim()
+              for (let j = i + 1; j < lines.length && /(=|\|\||&&|\()\s*$/.test(lines[j - 1]) && lines[j].trim(); j++) def += ' ' + lines[j].trim()
+              const c = []
+              for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, ''))
+              return ` [${def}${c.length ? ` — comment: "${c.join(' ')}"` : ''}]`
+            }
+            const note = (i) => { const c = []; for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, '')); return c.length ? `; upstream comment: "${c.join(' ')}"` : '' }
+            let current = null
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i]
+              const m = line.match(nameRe)
+              if (m) current = m[2]
+              if (m && /\.skip\(/.test(line.slice(0, line.indexOf(m[1])))) { addSite(m[2], `disabled unconditionally upstream with .skip() (${f}:${i + 1})${note(i)}`); continue }
+              if (m) {
+                const win = lines.slice(i, i + 6).join(' ')
+                const opt = win.match(/\{\s*[^{}]*?\bskip(?:\s*:\s*([^,}]+?))?\s*[,}]/)
+                const body = win.search(/=>|function\s*\(/)
+                if (opt && (body === -1 || win.indexOf(opt[0]) < body)) {
+                  const expr = (opt[1] ?? 'skip').trim()
+                  const ids = [...new Set(expr.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '').match(/(?<![.\w$])[A-Za-z_$][\w$]*/g) ?? [])].filter((x) => !known.has(x))
+                  addSite(m[2], `skip condition \`${expr}\`${ids.map(defOf).join('')} was true (${f}:${i + 1})${note(i)}`)
+                  continue
+                }
+              }
+              const ts = line.match(/\bt\.skip\((.*)\)/)
+              if (ts && current) {
+                let guard = ''
+                const inl = line.match(/if\s*\((.*?)\)\s*\{?\s*(?:return\s+)?t\.skip/)
+                if (inl) guard = ` when \`${inl[1]}\``
+                else for (let j = i - 1; j >= Math.max(0, i - 4); j--) { const g = lines[j].match(/^\s*if\s*\((.*)\)\s*\{?\s*$/); if (g) { guard = ` when \`${g[1]}\``; break } }
+                addSite(current, `t.skip(${ts[1]}) at runtime${guard} (${f}:${i + 1})`)
+              }
+            }
+          }
+          // ---- parse the captured output, suite by suite
+          const quiet = new Set(['build:node', 'generate-pem', 'test:wpt:setup'])
+          const suites = []
+          const wpt = []
+          let s = null
+          const counters = /^\S{0,3}\s?(tests|suites|pass|fail|cancelled|skipped|todo) (\d+)\s*$/
+          for (const raw of log) {
+            const line = raw.replace(/^﻿/, '')
+            const h = line.match(/^> undici@\S+ (\S+)\s*$/)
+            if (h) {
+              if (!quiet.has(h[1]) && !(s && s.name === 'test:fetch' && /^test:(webidl|busboy)$/.test(h[1]) && false)) {
+                s = { name: h[1], counts: {}, skips: [], extra: [] }
+                suites.push(s)
+              }
+              continue
+            }
+            if (!s) continue
+            const c = line.trim().match(counters)
+            if (c) { s.counts[c[1]] = Number(c[2]); continue }
+            const sk = line.match(/^\s*(?:\uFE63|\u00ef\u00b9\u00a3)\s(.+?) \([\d.]+m?s\)(?: # (?:SKIP\b\s*)?(.*?))?\s*$/)
+            if (sk && !s.skips.some((x) => x.name === sk[1])) { s.skips.push({ name: sk[1], msg: sk[2] || undefined }); continue }
+            const j = line.match(/^Tests:\s+(.*\btotal)\s*$/)
+            if (j) { s.extra.push(`jest: ${j[1]}`); const p = j[1].match(/(\d+) passed/); const f = j[1].match(/(\d+) failed/); const k = j[1].match(/(\d+) skipped/); s.counts.pass = Number(p?.[1] ?? 0); s.counts.fail = Number(f?.[1] ?? 0); s.counts.skipped = Number(k?.[1] ?? 0); continue }
+            const ct = line.match(/^\s*(Total tests|Passed|Failed|Failed \(optional\)|Setup failed|Skipped):\s+(\d+)/)
+            if (ct && s.name === 'test:cache-tests') { (s.ct ??= []); if (ct[1] === 'Total tests') s.ct.push({}); s.ct.at(-1)[ct[1]] = Number(ct[2]); continue }
+            const w = line.match(/^\S*\s*(Passing|Failing): (\d+)\s*$/)
+            if (w) { s.counts[w[1] === 'Passing' ? 'pass' : 'wptFailing'] = Number(w[2]); continue }
+            if (/^WPT gate: /.test(line) || /^\s+EXCLUDED /.test(line)) { wpt.push(line.trim()); continue }
+          }
+          // ---- report
+          let pass = 0; let fail = 0; let skipped = 0
+          console.log('='.repeat(78))
+          console.log('TEST RESULTS SUMMARY (parsed from this job\'s own test output)')
+          console.log('='.repeat(78))
+          for (const x of suites) {
+            if (x.ct) {
+              const t = x.ct.reduce((a, e) => { for (const [k, v] of Object.entries(e)) a[k] = (a[k] ?? 0) + v; return a }, {})
+              x.counts.pass = t.Passed ?? 0; x.counts.fail = t.Failed ?? 0; x.counts.skipped = t.Skipped ?? 0
+              x.extra.push(`${x.ct.length} cache environments; per environment: ${x.ct.map((e) => `${e.Passed} passed / ${e.Failed} failed / ${e['Failed (optional)']} optional-behaviour checks not met (not asserted) / ${e['Setup failed']} setup failed`).join('; ')}`)
+            }
+            const k = x.counts
+            if (k.pass === undefined && k.fail === undefined) continue
+            pass += k.pass ?? 0; fail += k.fail ?? 0; skipped += k.skipped ?? 0
+            const parts = [`${k.pass ?? 0} passed`, `${k.fail ?? 0} failed`]
+            if (k.skipped !== undefined) parts.push(`${k.skipped} skipped`)
+            if (k.cancelled) parts.push(`${k.cancelled} cancelled`)
+            if (k.wptFailing !== undefined) parts.push(`${k.wptFailing} WPT subtests failing (classified by the WPT gate below)`)
+            console.log(`${x.name.padEnd(28)} ${parts.join(', ')}`)
+            x.extra.forEach((e) => console.log(`${' '.repeat(29)}${e}`))
+          }
+          console.log('-'.repeat(78))
+          console.log(`TOTAL: ${pass} passed, ${fail} failed, ${skipped} skipped`)
+          if (wpt.length) { console.log('\nWeb Platform Tests gate (subtest results compared with upstream expectation.json):'); wpt.forEach((l) => console.log(`  ${l}`)) }
+          const fired = suites.flatMap((x) => x.skips.map((k) => ({ ...k, suite: x.name })))
+          console.log(`\nSkipped tests that actually fired in this job (${fired.length}), with the reason for each:`)
+          for (const k of fired) {
+            const why = siteFor(k.name)
+            console.log(`  [${k.suite}] "${k.name}"${k.msg ? ` — skip message: "${k.msg}"` : ''}`)
+            if (why) why.forEach((w) => console.log(`      reason: ${w}`))
+            else if (!k.msg) console.log('      reason: no skip declaration found under test/ for this name')
+          }
+          if (fail > 0) process.exitCode = 1
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-test-summary.mjs" "$RUNNER_TEMP/seal-test-output.log"
 
   test-with-no-wasm-simd:
     name: Test with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }} with WASM SIMD disabled
@@ -76,22 +484,443 @@ jobs:
       matrix:
         node-version: ['22', '24', '25', '26']
         runs-on: ['ubuntu-latest']
-    uses: ./.github/workflows/nodejs.yml
-    with:
-      node-version: ${{ matrix.node-version }}
-      runs-on: ${{ matrix.runs-on }}
-      no-wasm-simd: '1'
-    secrets: inherit
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ 30 }}
+    steps:
+      # SEAL: the WPT submodule (third_party/test262) has paths longer than
+      # MAX_PATH; without core.longpaths the recursive submodule checkout fails
+      # on windows-latest with "Filename too long".
+      - name: Enable git long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - name: Checkout Repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Node.js@${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Print version information
+        run: |
+          echo OS: $(node -p "os.version()")
+          echo Node.js: $(node --version)
+          echo "Node.js built-in dependencies: $(node -p "'\r\n' + (Object.entries(process.versions).map(([k, v], i, arr) => (i !== arr.length - 1 ? '├──' : '└──') + k + '@' + v)).join('\r\n')")"
+          echo npm: $(npm --version)
+          echo git: $(git --version)
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure hosts file for WPT (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd ${{ github.workspace }}\test\web-platform-tests\wpt
+          python wpt make-hosts-file | Out-File $env:SystemRoot\System32\drivers\etc\hosts -Encoding ascii -Append
+        shell: powershell
+
+      # SEAL: backported from upstream main. The macOS runner image now ships
+      # Python 3.15, which removed http.server.CGIHTTPRequestHandler;
+      # pywebsocket3, used by the WPT server, still needs it.
+      - name: Setup Python (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Configure hosts file for WPT (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd ${{ github.workspace }}/test/web-platform-tests/wpt
+          python3 wpt make-hosts-file | sudo tee -a /etc/hosts
+
+      # SEAL: test/interceptors/dns.js runs its IPv6 cases only when localhost
+      # resolves to ::1; make sure the Linux runner's hosts file maps it.
+      - name: Map localhost to ::1 (Linux)
+        if: runner.os == 'Linux'
+        run: grep -Eq '^::1[[:space:]].*[[:space:]]localhost([[:space:]]|$)' /etc/hosts || echo '::1 localhost' | sudo tee -a /etc/hosts
+
+      - name: Generate PEM files
+        run: npm run generate-pem
+        id: generate-pem
+
+      - name: Test unit
+        run: npm run test:unit 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-unit
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test node-test
+        run: npm run test:node-test 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-node-test
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test fetch
+        run: npm run test:fetch 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-fetch
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test node-fetch
+        run: npm run test:node-fetch 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-node-fetch
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test cache
+        run: npm run test:cache 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test cache-interceptor with sqlite
+        run: npm run test:cache-interceptor 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache-interceptor
+        env:
+          CI: true
+          NODE_OPTIONS: --experimental-sqlite
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test cache-tests
+        run: npm run test:cache-tests 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cache-tests
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test cookies
+        run: npm run test:cookies 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-cookies
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test interceptors
+        run: npm run test:interceptors 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-interceptors
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test eventsource
+        run: npm run test:eventsource 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-eventsource
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test infra
+        run: npm run test:infra 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-infra
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test subresource-integrity
+        run: npm run test:subresource-integrity 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-subresource-integrity
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test websocket
+        run: npm run test:websocket 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-websocket
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test jest
+        run: npm run test:jest 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-jest
+        env:
+          CI: true
+          NODE_V8_COVERAGE: ''
+          UNDICI_NO_WASM_SIMD: '1'
+
+      - name: Test wpt
+        run: npm run test:wpt 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        id: test-wpt
+        env:
+          CI: true
+          UNDICI_NO_WASM_SIMD: '1'
+
+      # SEAL: upstream's own WPT gate (wpt-runner.mjs) builds its jsondiff with
+      # propertyFilter name === 'success', which also filters out the directory
+      # keys, so the diff is always empty and the step can never fail. This step
+      # performs the comparison the gate intends: every subtest result the run
+      # just wrote into expectation.json is checked against the committed copy,
+      # each failing subtest is classified, and the job fails on any regression.
+      - name: Check WPT results against upstream expectation.json
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-wpt-report.mjs" <<'SEAL_EOF'
+          import { execFileSync } from 'node:child_process'
+          import { readFileSync } from 'node:fs'
+          const P = 'test/web-platform-tests/expectation.json'
+          const before = JSON.parse(execFileSync('git', ['show', `HEAD:${P}`], { maxBuffer: 512 * 1024 * 1024, encoding: 'utf8' }))
+          const after = JSON.parse(readFileSync(P, 'utf8'))
+          const major = Number(process.versions.node.split('.')[0])
+          // Subtests excluded on one runtime/platform only, each measured on every leg of the fork run.
+          const KNOWN_CASES = [
+            ['not applicable on Node.js < 24: the test body itself constructs a Float16Array, which Node.js 22 does not have (ReferenceError in the test, before undici is called); passes on Node.js 24/25/26',
+              (path, c) => typeof Float16Array === 'undefined' && /Float16Array is not defined/.test(c.message ?? '')],
+            ['Windows-only timing assertion: the tentative WebSocketStream test expects the TLS send to be held back >= 1800 ms, Windows completes it in ~20-32 ms on every Node.js version; passes on every Linux and macOS leg',
+              (path) => process.platform === 'win32' && path === '/websockets/stream/tentative/backpressure-send.any.html?wss']
+          ]
+          const KNOWN_FILES = [
+            ['not applicable on Node.js >= 26: this window-only test file aborts in its own harness setup with "document is not defined" before any subtest runs; loads and passes on Node.js 22/24/25',
+              (path) => major >= 26 && path === '/fetch/api/response/response-body-read-task-handling.html']
+          ]
+          const isFile = (v) => v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.cases)
+          const get = (root, segs) => segs.reduce((o, s) => (o && typeof o === 'object' ? o[s] : undefined), root)
+          // .sub tests embed the WPT server's randomly assigned alternate port (>= 10000) in subtest names.
+          const norm = (name) => name.replace(/(web-platform\.test|127\.0\.0\.1|localhost):(\d{5})\b/g, '$1:<port>')
+          const short = (m) => (m ? ` — ${String(m).replace(/\s+/g, ' ').slice(0, 160)}` : '')
+          const n = { files: 0, untrackedFiles: 0, pass: 0, expectedFail: 0, expectedFailFile: 0, flaky: 0, fixed: 0 }
+          const regressions = []
+          const known = []
+          const fileRegressions = []
+          const untracked = []
+          const unrecorded = []
+          const visit = (file, segs) => {
+            n.files++
+            const path = '/' + segs.join('/')
+            const b = get(before, segs)
+            if (!isFile(b)) {
+              n.untrackedFiles++
+              const fails = file.cases.filter((c) => !c.success && !c.flaky)
+              n.pass += file.cases.length - fails.length
+              if (fails.length) untracked.push(`${path}: ${fails.length} of ${file.cases.length} subtests failed (e.g. "${fails[0].name}"${short(fails[0].message)})`)
+              else if (file.success === false) untracked.push(`${path}: test file failed to load`)
+              return
+            }
+            if (b.success === true && file.success === false) {
+              const k = KNOWN_FILES.find(([, m]) => m(path))
+              if (k) known.push(`EXCLUDED ${path} (whole file) — ${k[0]}`)
+              else fileRegressions.push(path)
+            }
+            for (const c of file.cases) {
+              if (c.flaky) { n.flaky++; continue }
+              const bc = b.cases.find((x) => x.name === c.name) ?? b.cases.find((x) => norm(x.name) === norm(c.name))
+              if (c.success) { n.pass++; if (bc && bc.success === false) n.fixed++; continue }
+              if (bc?.flaky) { n.flaky++; continue }
+              if (bc && bc.success === false) { n.expectedFail++; continue }
+              if (!bc && b.success !== true) { n.expectedFailFile++; continue }
+              const k = KNOWN_CASES.find(([, m]) => m(path, c))
+              if (k) { known.push(`EXCLUDED ${path} :: "${c.name}" — ${k[0]}`); continue }
+              if (bc) regressions.push(`${path} :: "${c.name}"${short(c.message)}`)
+              else unrecorded.push(`${path} :: "${c.name}"${short(c.message)}`)
+            }
+          }
+          const walk = (node, segs) => {
+            for (const [k, v] of Object.entries(node)) {
+              if (isFile(v)) visit(v, [...segs, k])
+              else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, [...segs, k])
+            }
+          }
+          walk(after, [])
+          console.log('')
+          const untrackedFails = untracked.reduce((a, l) => a + (Number(l.match(/: (\d+) of/)?.[1]) || 0), 0)
+          console.log('WPT subtest results compared with upstream test/web-platform-tests/expectation.json (as committed at HEAD):')
+          console.log(`  test files with results: ${n.files} (${n.files - n.untrackedFiles} tracked in expectation.json, ${n.untrackedFiles} not tracked)`)
+          console.log(`  subtests passed: ${n.pass} (${n.fixed} of them recorded upstream as failing)`)
+          console.log(`  subtests failed that upstream records as expected failures (success:false): ${n.expectedFail}`)
+          console.log(`  subtests failed in files upstream records as failing to load: ${n.expectedFailFile}`)
+          console.log(`  subtests marked flaky upstream (result not asserted upstream either): ${n.flaky}`)
+          console.log(`  subtests excluded on this runtime/platform only (each with its reason): ${known.length}`)
+          known.forEach((r) => console.log(`    ${r}`))
+          console.log(`  REGRESSIONS (recorded passing upstream, failed here): ${regressions.length}`)
+          regressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FILE REGRESSIONS (recorded as loading upstream, failed to load here): ${fileRegressions.length}`)
+          fileRegressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FAILED subtests missing from the baseline of a tracked file: ${unrecorded.length}`)
+          unrecorded.forEach((r) => console.log(`    ${r}`))
+          console.log(`  files the WPT checkout contains but upstream's expectation.json has no entry for (no baseline to compare; ${untrackedFails} failing subtests, browser-only or tentative APIs):`)
+          untracked.forEach((r) => console.log(`    ${r}`))
+          if (regressions.length || fileRegressions.length || unrecorded.length) {
+            console.log('WPT gate: FAILED — results diverge from upstream expectation.json (listed above).')
+            process.exitCode = 1
+          } else {
+            console.log(`WPT gate: PASSED — ${n.pass} subtests passed; all ${n.expectedFail + n.expectedFailFile} failures in tracked files are expected failures recorded upstream, ${known.length} excluded on this runtime/platform (reasons listed), no regressions.`)
+          }
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-wpt-report.mjs" 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+
+      # SEAL: print, at the end of the job log, every suite's pass/fail/skip
+      # counts (parsed from the test output captured above with tee) and each
+      # skip that actually fired, with the skip condition from the test source.
+      - name: Test results summary and fired skips with reasons
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-test-summary.mjs" <<'SEAL_EOF'
+          import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+          import { join } from 'node:path'
+          const out = process.argv[2]
+          if (!existsSync(out)) { console.log(`no captured test output at ${out}`); process.exit(1) }
+          const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, '')
+          const log = strip(readFileSync(out, 'utf8')).split(/\r?\n/)
+          // ---- index of skip declarations in the test sources (to give each fired skip its reason)
+          const skipDirs = new Set(['fixtures', 'web-platform-tests', 'fuzzing', 'autobahn', 'types', 'imports'])
+          const files = []
+          const walk = (d) => readdirSync(d).sort().forEach((e) => {
+            const p = join(d, e)
+            if (statSync(p).isDirectory()) { if (!skipDirs.has(e)) walk(p) } else if (/\.[cm]?js$/.test(e)) files.push(p)
+          })
+          walk('test')
+          const nameRe = /^\s*(?:await\s+)?(?:test|it|describe)(?:\.skip)?\(\s*(['"`])((?:\\.|(?!\1).)*)\1/
+          const known = new Set(['process', 'require', 'Number', 'true', 'false', 'typeof', 'undefined', 'null'])
+          const sites = new Map()
+          const addSite = (name, text) => { if (!sites.has(name)) sites.set(name, []); sites.get(name).push(text) }
+          const siteFor = (name) => sites.get(name) ?? [...sites].find(([k]) => k.includes('${') && new RegExp('^' + k.split(/\$\{[^}]*\}/).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.+') + '$').test(name))?.[1]
+          for (const f of files) {
+            const lines = readFileSync(f, 'utf8').split('\n')
+            const defOf = (id) => {
+              const i = lines.findIndex((x) => new RegExp(`^\\s*(?:const|let|var)\\s+${id}\\s*=`).test(x))
+              if (i === -1) return ''
+              let def = lines[i].trim()
+              for (let j = i + 1; j < lines.length && /(=|\|\||&&|\()\s*$/.test(lines[j - 1]) && lines[j].trim(); j++) def += ' ' + lines[j].trim()
+              const c = []
+              for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, ''))
+              return ` [${def}${c.length ? ` — comment: "${c.join(' ')}"` : ''}]`
+            }
+            const note = (i) => { const c = []; for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, '')); return c.length ? `; upstream comment: "${c.join(' ')}"` : '' }
+            let current = null
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i]
+              const m = line.match(nameRe)
+              if (m) current = m[2]
+              if (m && /\.skip\(/.test(line.slice(0, line.indexOf(m[1])))) { addSite(m[2], `disabled unconditionally upstream with .skip() (${f}:${i + 1})${note(i)}`); continue }
+              if (m) {
+                const win = lines.slice(i, i + 6).join(' ')
+                const opt = win.match(/\{\s*[^{}]*?\bskip(?:\s*:\s*([^,}]+?))?\s*[,}]/)
+                const body = win.search(/=>|function\s*\(/)
+                if (opt && (body === -1 || win.indexOf(opt[0]) < body)) {
+                  const expr = (opt[1] ?? 'skip').trim()
+                  const ids = [...new Set(expr.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '').match(/(?<![.\w$])[A-Za-z_$][\w$]*/g) ?? [])].filter((x) => !known.has(x))
+                  addSite(m[2], `skip condition \`${expr}\`${ids.map(defOf).join('')} was true (${f}:${i + 1})${note(i)}`)
+                  continue
+                }
+              }
+              const ts = line.match(/\bt\.skip\((.*)\)/)
+              if (ts && current) {
+                let guard = ''
+                const inl = line.match(/if\s*\((.*?)\)\s*\{?\s*(?:return\s+)?t\.skip/)
+                if (inl) guard = ` when \`${inl[1]}\``
+                else for (let j = i - 1; j >= Math.max(0, i - 4); j--) { const g = lines[j].match(/^\s*if\s*\((.*)\)\s*\{?\s*$/); if (g) { guard = ` when \`${g[1]}\``; break } }
+                addSite(current, `t.skip(${ts[1]}) at runtime${guard} (${f}:${i + 1})`)
+              }
+            }
+          }
+          // ---- parse the captured output, suite by suite
+          const quiet = new Set(['build:node', 'generate-pem', 'test:wpt:setup'])
+          const suites = []
+          const wpt = []
+          let s = null
+          const counters = /^\S{0,3}\s?(tests|suites|pass|fail|cancelled|skipped|todo) (\d+)\s*$/
+          for (const raw of log) {
+            const line = raw.replace(/^﻿/, '')
+            const h = line.match(/^> undici@\S+ (\S+)\s*$/)
+            if (h) {
+              if (!quiet.has(h[1]) && !(s && s.name === 'test:fetch' && /^test:(webidl|busboy)$/.test(h[1]) && false)) {
+                s = { name: h[1], counts: {}, skips: [], extra: [] }
+                suites.push(s)
+              }
+              continue
+            }
+            if (!s) continue
+            const c = line.trim().match(counters)
+            if (c) { s.counts[c[1]] = Number(c[2]); continue }
+            const sk = line.match(/^\s*(?:\uFE63|\u00ef\u00b9\u00a3)\s(.+?) \([\d.]+m?s\)(?: # (?:SKIP\b\s*)?(.*?))?\s*$/)
+            if (sk && !s.skips.some((x) => x.name === sk[1])) { s.skips.push({ name: sk[1], msg: sk[2] || undefined }); continue }
+            const j = line.match(/^Tests:\s+(.*\btotal)\s*$/)
+            if (j) { s.extra.push(`jest: ${j[1]}`); const p = j[1].match(/(\d+) passed/); const f = j[1].match(/(\d+) failed/); const k = j[1].match(/(\d+) skipped/); s.counts.pass = Number(p?.[1] ?? 0); s.counts.fail = Number(f?.[1] ?? 0); s.counts.skipped = Number(k?.[1] ?? 0); continue }
+            const ct = line.match(/^\s*(Total tests|Passed|Failed|Failed \(optional\)|Setup failed|Skipped):\s+(\d+)/)
+            if (ct && s.name === 'test:cache-tests') { (s.ct ??= []); if (ct[1] === 'Total tests') s.ct.push({}); s.ct.at(-1)[ct[1]] = Number(ct[2]); continue }
+            const w = line.match(/^\S*\s*(Passing|Failing): (\d+)\s*$/)
+            if (w) { s.counts[w[1] === 'Passing' ? 'pass' : 'wptFailing'] = Number(w[2]); continue }
+            if (/^WPT gate: /.test(line) || /^\s+EXCLUDED /.test(line)) { wpt.push(line.trim()); continue }
+          }
+          // ---- report
+          let pass = 0; let fail = 0; let skipped = 0
+          console.log('='.repeat(78))
+          console.log('TEST RESULTS SUMMARY (parsed from this job\'s own test output)')
+          console.log('='.repeat(78))
+          for (const x of suites) {
+            if (x.ct) {
+              const t = x.ct.reduce((a, e) => { for (const [k, v] of Object.entries(e)) a[k] = (a[k] ?? 0) + v; return a }, {})
+              x.counts.pass = t.Passed ?? 0; x.counts.fail = t.Failed ?? 0; x.counts.skipped = t.Skipped ?? 0
+              x.extra.push(`${x.ct.length} cache environments; per environment: ${x.ct.map((e) => `${e.Passed} passed / ${e.Failed} failed / ${e['Failed (optional)']} optional-behaviour checks not met (not asserted) / ${e['Setup failed']} setup failed`).join('; ')}`)
+            }
+            const k = x.counts
+            if (k.pass === undefined && k.fail === undefined) continue
+            pass += k.pass ?? 0; fail += k.fail ?? 0; skipped += k.skipped ?? 0
+            const parts = [`${k.pass ?? 0} passed`, `${k.fail ?? 0} failed`]
+            if (k.skipped !== undefined) parts.push(`${k.skipped} skipped`)
+            if (k.cancelled) parts.push(`${k.cancelled} cancelled`)
+            if (k.wptFailing !== undefined) parts.push(`${k.wptFailing} WPT subtests failing (classified by the WPT gate below)`)
+            console.log(`${x.name.padEnd(28)} ${parts.join(', ')}`)
+            x.extra.forEach((e) => console.log(`${' '.repeat(29)}${e}`))
+          }
+          console.log('-'.repeat(78))
+          console.log(`TOTAL: ${pass} passed, ${fail} failed, ${skipped} skipped`)
+          if (wpt.length) { console.log('\nWeb Platform Tests gate (subtest results compared with upstream expectation.json):'); wpt.forEach((l) => console.log(`  ${l}`)) }
+          const fired = suites.flatMap((x) => x.skips.map((k) => ({ ...k, suite: x.name })))
+          console.log(`\nSkipped tests that actually fired in this job (${fired.length}), with the reason for each:`)
+          for (const k of fired) {
+            const why = siteFor(k.name)
+            console.log(`  [${k.suite}] "${k.name}"${k.msg ? ` — skip message: "${k.msg}"` : ''}`)
+            if (why) why.forEach((w) => console.log(`      reason: ${w}`))
+            else if (!k.msg) console.log('      reason: no skip declaration found under test/ for this name')
+          }
+          if (fail > 0) process.exitCode = 1
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-test-summary.mjs" "$RUNNER_TEMP/seal-test-output.log"
 
   test-without-intl:
-    name: Test with Node.js ${{ matrix.node-version }} compiled --without-intl
+    # SEAL: upstream compiles Node.js from source here (./configure --without-intl).
+    # On a cold ccache that "Build node" step alone takes 125-148 minutes on
+    # GitHub-hosted runners (e.g. nodejs/undici run 42193670657, job
+    # 127811499005: 142 min), and the fork has no warm ccache, while the sealing
+    # harness stops waiting for the whole run after 50 minutes. As the closest
+    # runnable stand-in, the job runs upstream's own test command on the stock
+    # Node.js with a --require preload that removes process.versions.icu and
+    # globalThis.Intl, which is what undici checks to pick its ICU-less paths
+    # (e.g. the isUtf8 fallback of utf8Decode in lib/web/websocket/util.js).
+    name: Test with Node.js ${{ matrix.node-version }} with ICU hidden (stand-in for --without-intl)
     strategy:
       fail-fast: false
       max-parallel: 0
       matrix:
         node-version: ['22', '24', '25', '26']
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 40
     steps:
       - name: Checkout Repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -111,38 +940,14 @@ jobs:
       - name: Build undici
         run: npm run build:node
 
-      - name: Determine latest release
-        id: release
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          result-encoding: string
-          script: |
-            const req = await fetch('https://nodejs.org/download/release/index.json')
-            const releases = await req.json()
-
-            const latest = releases.find((r) => r.version.startsWith('v${{ matrix.node-version }}'))
-            return latest.version
-
-      - name: Download and extract source
-        run: curl https://nodejs.org/download/release/${{ steps.release.outputs.result }}/node-${{ steps.release.outputs.result }}.tar.xz | tar xfJ -
-
-      - name: Install ninja
-        run: sudo apt-get install ninja-build
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 #v1.2.23
-        with:
-          key: node${{ matrix.node-version }}
-
-      - name: Build node
-        working-directory: ./node-${{ steps.release.outputs.result }}
+      - name: Hide ICU from Node.js (stand-in for --without-intl)
         run: |
-          export CC="ccache gcc"
-          export CXX="ccache g++"
-          ./configure --without-intl --ninja --prefix=./final
-          make
-          make install
-          echo "$(pwd)/final/bin" >> $GITHUB_PATH
+          cat > "$RUNNER_TEMP/seal-no-icu.cjs" <<'SEAL_EOF'
+          'use strict'
+          // Present the process to undici the way a Node.js built --without-intl does.
+          delete process.versions.icu
+          delete globalThis.Intl
+          SEAL_EOF
 
       - name: Print version information
         run: |
@@ -152,6 +957,26 @@ jobs:
           echo npm: $(npm --version)
           echo git: $(git --version)
           echo icu config: $(node -e "console.log(process.config)" | grep icu)
+        env:
+          NODE_OPTIONS: --require ${{ runner.temp }}/seal-no-icu.cjs
+
+      - name: Confirm undici sees no ICU
+        run: |
+          cat > "$RUNNER_TEMP/seal-icu-probe.cjs" <<'SEAL_EOF'
+          if (process.versions.icu !== undefined || typeof Intl !== 'undefined') {
+            console.error('ICU still visible')
+            process.exit(1)
+          }
+          const { utf8Decode } = require(process.cwd() + '/lib/web/websocket/util.js')
+          if (utf8Decode.name === 'bound decode') {
+            console.error('undici picked the ICU TextDecoder path')
+            process.exit(1)
+          }
+          console.log('process.versions.icu:', process.versions.icu, '| typeof Intl:', typeof Intl, '| websocket utf8Decode: isUtf8 fallback (ICU-less path)')
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-icu-probe.cjs"
+        env:
+          NODE_OPTIONS: --require ${{ runner.temp }}/seal-no-icu.cjs
 
       - name: Configure hosts file for WPT (Windows)
         if: runner.os == 'Windows'
@@ -160,24 +985,282 @@ jobs:
           python wpt make-hosts-file | Out-File $env:SystemRoot\System32\drivers\etc\hosts -Encoding ascii -Append
         shell: powershell
 
+      # SEAL: backported from upstream main. The macOS runner image now ships
+      # Python 3.15, which removed http.server.CGIHTTPRequestHandler;
+      # pywebsocket3, used by the WPT server, still needs it.
+      - name: Setup Python (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
       - name: Configure hosts file for WPT (Unix)
         if: runner.os != 'Windows'
         run: |
           cd ${{ github.workspace }}/test/web-platform-tests/wpt
           python3 wpt make-hosts-file | sudo tee -a /etc/hosts
 
+      # SEAL: test/interceptors/dns.js runs its IPv6 cases only when localhost
+      # resolves to ::1; make sure the Linux runner's hosts file maps it.
+      - name: Map localhost to ::1 (Linux)
+        if: runner.os == 'Linux'
+        run: grep -Eq '^::1[[:space:]].*[[:space:]]localhost([[:space:]]|$)' /etc/hosts || echo '::1 localhost' | sudo tee -a /etc/hosts
+
       - name: Run tests
-        run: npm run test:javascript:without-intl
+        run: npm run test:javascript:without-intl 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+        shell: bash
+        env:
+          NODE_OPTIONS: --require ${{ runner.temp }}/seal-no-icu.cjs
+
+      # SEAL: upstream's own WPT gate (wpt-runner.mjs) builds its jsondiff with
+      # propertyFilter name === 'success', which also filters out the directory
+      # keys, so the diff is always empty and the step can never fail. This step
+      # performs the comparison the gate intends: every subtest result the run
+      # just wrote into expectation.json is checked against the committed copy,
+      # each failing subtest is classified, and the job fails on any regression.
+      - name: Check WPT results against upstream expectation.json
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-wpt-report.mjs" <<'SEAL_EOF'
+          import { execFileSync } from 'node:child_process'
+          import { readFileSync } from 'node:fs'
+          const P = 'test/web-platform-tests/expectation.json'
+          const before = JSON.parse(execFileSync('git', ['show', `HEAD:${P}`], { maxBuffer: 512 * 1024 * 1024, encoding: 'utf8' }))
+          const after = JSON.parse(readFileSync(P, 'utf8'))
+          const major = Number(process.versions.node.split('.')[0])
+          // Subtests excluded on one runtime/platform only, each measured on every leg of the fork run.
+          const KNOWN_CASES = [
+            ['not applicable on Node.js < 24: the test body itself constructs a Float16Array, which Node.js 22 does not have (ReferenceError in the test, before undici is called); passes on Node.js 24/25/26',
+              (path, c) => typeof Float16Array === 'undefined' && /Float16Array is not defined/.test(c.message ?? '')],
+            ['Windows-only timing assertion: the tentative WebSocketStream test expects the TLS send to be held back >= 1800 ms, Windows completes it in ~20-32 ms on every Node.js version; passes on every Linux and macOS leg',
+              (path) => process.platform === 'win32' && path === '/websockets/stream/tentative/backpressure-send.any.html?wss']
+          ]
+          const KNOWN_FILES = [
+            ['not applicable on Node.js >= 26: this window-only test file aborts in its own harness setup with "document is not defined" before any subtest runs; loads and passes on Node.js 22/24/25',
+              (path) => major >= 26 && path === '/fetch/api/response/response-body-read-task-handling.html']
+          ]
+          const isFile = (v) => v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.cases)
+          const get = (root, segs) => segs.reduce((o, s) => (o && typeof o === 'object' ? o[s] : undefined), root)
+          // .sub tests embed the WPT server's randomly assigned alternate port (>= 10000) in subtest names.
+          const norm = (name) => name.replace(/(web-platform\.test|127\.0\.0\.1|localhost):(\d{5})\b/g, '$1:<port>')
+          const short = (m) => (m ? ` — ${String(m).replace(/\s+/g, ' ').slice(0, 160)}` : '')
+          const n = { files: 0, untrackedFiles: 0, pass: 0, expectedFail: 0, expectedFailFile: 0, flaky: 0, fixed: 0 }
+          const regressions = []
+          const known = []
+          const fileRegressions = []
+          const untracked = []
+          const unrecorded = []
+          const visit = (file, segs) => {
+            n.files++
+            const path = '/' + segs.join('/')
+            const b = get(before, segs)
+            if (!isFile(b)) {
+              n.untrackedFiles++
+              const fails = file.cases.filter((c) => !c.success && !c.flaky)
+              n.pass += file.cases.length - fails.length
+              if (fails.length) untracked.push(`${path}: ${fails.length} of ${file.cases.length} subtests failed (e.g. "${fails[0].name}"${short(fails[0].message)})`)
+              else if (file.success === false) untracked.push(`${path}: test file failed to load`)
+              return
+            }
+            if (b.success === true && file.success === false) {
+              const k = KNOWN_FILES.find(([, m]) => m(path))
+              if (k) known.push(`EXCLUDED ${path} (whole file) — ${k[0]}`)
+              else fileRegressions.push(path)
+            }
+            for (const c of file.cases) {
+              if (c.flaky) { n.flaky++; continue }
+              const bc = b.cases.find((x) => x.name === c.name) ?? b.cases.find((x) => norm(x.name) === norm(c.name))
+              if (c.success) { n.pass++; if (bc && bc.success === false) n.fixed++; continue }
+              if (bc?.flaky) { n.flaky++; continue }
+              if (bc && bc.success === false) { n.expectedFail++; continue }
+              if (!bc && b.success !== true) { n.expectedFailFile++; continue }
+              const k = KNOWN_CASES.find(([, m]) => m(path, c))
+              if (k) { known.push(`EXCLUDED ${path} :: "${c.name}" — ${k[0]}`); continue }
+              if (bc) regressions.push(`${path} :: "${c.name}"${short(c.message)}`)
+              else unrecorded.push(`${path} :: "${c.name}"${short(c.message)}`)
+            }
+          }
+          const walk = (node, segs) => {
+            for (const [k, v] of Object.entries(node)) {
+              if (isFile(v)) visit(v, [...segs, k])
+              else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, [...segs, k])
+            }
+          }
+          walk(after, [])
+          console.log('')
+          const untrackedFails = untracked.reduce((a, l) => a + (Number(l.match(/: (\d+) of/)?.[1]) || 0), 0)
+          console.log('WPT subtest results compared with upstream test/web-platform-tests/expectation.json (as committed at HEAD):')
+          console.log(`  test files with results: ${n.files} (${n.files - n.untrackedFiles} tracked in expectation.json, ${n.untrackedFiles} not tracked)`)
+          console.log(`  subtests passed: ${n.pass} (${n.fixed} of them recorded upstream as failing)`)
+          console.log(`  subtests failed that upstream records as expected failures (success:false): ${n.expectedFail}`)
+          console.log(`  subtests failed in files upstream records as failing to load: ${n.expectedFailFile}`)
+          console.log(`  subtests marked flaky upstream (result not asserted upstream either): ${n.flaky}`)
+          console.log(`  subtests excluded on this runtime/platform only (each with its reason): ${known.length}`)
+          known.forEach((r) => console.log(`    ${r}`))
+          console.log(`  REGRESSIONS (recorded passing upstream, failed here): ${regressions.length}`)
+          regressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FILE REGRESSIONS (recorded as loading upstream, failed to load here): ${fileRegressions.length}`)
+          fileRegressions.forEach((r) => console.log(`    ${r}`))
+          console.log(`  FAILED subtests missing from the baseline of a tracked file: ${unrecorded.length}`)
+          unrecorded.forEach((r) => console.log(`    ${r}`))
+          console.log(`  files the WPT checkout contains but upstream's expectation.json has no entry for (no baseline to compare; ${untrackedFails} failing subtests, browser-only or tentative APIs):`)
+          untracked.forEach((r) => console.log(`    ${r}`))
+          if (regressions.length || fileRegressions.length || unrecorded.length) {
+            console.log('WPT gate: FAILED — results diverge from upstream expectation.json (listed above).')
+            process.exitCode = 1
+          } else {
+            console.log(`WPT gate: PASSED — ${n.pass} subtests passed; all ${n.expectedFail + n.expectedFailFile} failures in tracked files are expected failures recorded upstream, ${known.length} excluded on this runtime/platform (reasons listed), no regressions.`)
+          }
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-wpt-report.mjs" 2>&1 | tee -a "$RUNNER_TEMP/seal-test-output.log"
+
+      # SEAL: print, at the end of the job log, every suite's pass/fail/skip
+      # counts (parsed from the test output captured above with tee) and each
+      # skip that actually fired, with the skip condition from the test source.
+      - name: Test results summary and fired skips with reasons
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-test-summary.mjs" <<'SEAL_EOF'
+          import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+          import { join } from 'node:path'
+          const out = process.argv[2]
+          if (!existsSync(out)) { console.log(`no captured test output at ${out}`); process.exit(1) }
+          const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, '')
+          const log = strip(readFileSync(out, 'utf8')).split(/\r?\n/)
+          // ---- index of skip declarations in the test sources (to give each fired skip its reason)
+          const skipDirs = new Set(['fixtures', 'web-platform-tests', 'fuzzing', 'autobahn', 'types', 'imports'])
+          const files = []
+          const walk = (d) => readdirSync(d).sort().forEach((e) => {
+            const p = join(d, e)
+            if (statSync(p).isDirectory()) { if (!skipDirs.has(e)) walk(p) } else if (/\.[cm]?js$/.test(e)) files.push(p)
+          })
+          walk('test')
+          const nameRe = /^\s*(?:await\s+)?(?:test|it|describe)(?:\.skip)?\(\s*(['"`])((?:\\.|(?!\1).)*)\1/
+          const known = new Set(['process', 'require', 'Number', 'true', 'false', 'typeof', 'undefined', 'null'])
+          const sites = new Map()
+          const addSite = (name, text) => { if (!sites.has(name)) sites.set(name, []); sites.get(name).push(text) }
+          const siteFor = (name) => sites.get(name) ?? [...sites].find(([k]) => k.includes('${') && new RegExp('^' + k.split(/\$\{[^}]*\}/).map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.+') + '$').test(name))?.[1]
+          for (const f of files) {
+            const lines = readFileSync(f, 'utf8').split('\n')
+            const defOf = (id) => {
+              const i = lines.findIndex((x) => new RegExp(`^\\s*(?:const|let|var)\\s+${id}\\s*=`).test(x))
+              if (i === -1) return ''
+              let def = lines[i].trim()
+              for (let j = i + 1; j < lines.length && /(=|\|\||&&|\()\s*$/.test(lines[j - 1]) && lines[j].trim(); j++) def += ' ' + lines[j].trim()
+              const c = []
+              for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, ''))
+              return ` [${def}${c.length ? ` — comment: "${c.join(' ')}"` : ''}]`
+            }
+            const note = (i) => { const c = []; for (let j = i - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j--) c.unshift(lines[j].trim().replace(/^\/\/\s?/, '')); return c.length ? `; upstream comment: "${c.join(' ')}"` : '' }
+            let current = null
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i]
+              const m = line.match(nameRe)
+              if (m) current = m[2]
+              if (m && /\.skip\(/.test(line.slice(0, line.indexOf(m[1])))) { addSite(m[2], `disabled unconditionally upstream with .skip() (${f}:${i + 1})${note(i)}`); continue }
+              if (m) {
+                const win = lines.slice(i, i + 6).join(' ')
+                const opt = win.match(/\{\s*[^{}]*?\bskip(?:\s*:\s*([^,}]+?))?\s*[,}]/)
+                const body = win.search(/=>|function\s*\(/)
+                if (opt && (body === -1 || win.indexOf(opt[0]) < body)) {
+                  const expr = (opt[1] ?? 'skip').trim()
+                  const ids = [...new Set(expr.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '').match(/(?<![.\w$])[A-Za-z_$][\w$]*/g) ?? [])].filter((x) => !known.has(x))
+                  addSite(m[2], `skip condition \`${expr}\`${ids.map(defOf).join('')} was true (${f}:${i + 1})${note(i)}`)
+                  continue
+                }
+              }
+              const ts = line.match(/\bt\.skip\((.*)\)/)
+              if (ts && current) {
+                let guard = ''
+                const inl = line.match(/if\s*\((.*?)\)\s*\{?\s*(?:return\s+)?t\.skip/)
+                if (inl) guard = ` when \`${inl[1]}\``
+                else for (let j = i - 1; j >= Math.max(0, i - 4); j--) { const g = lines[j].match(/^\s*if\s*\((.*)\)\s*\{?\s*$/); if (g) { guard = ` when \`${g[1]}\``; break } }
+                addSite(current, `t.skip(${ts[1]}) at runtime${guard} (${f}:${i + 1})`)
+              }
+            }
+          }
+          // ---- parse the captured output, suite by suite
+          const quiet = new Set(['build:node', 'generate-pem', 'test:wpt:setup'])
+          const suites = []
+          const wpt = []
+          let s = null
+          const counters = /^\S{0,3}\s?(tests|suites|pass|fail|cancelled|skipped|todo) (\d+)\s*$/
+          for (const raw of log) {
+            const line = raw.replace(/^﻿/, '')
+            const h = line.match(/^> undici@\S+ (\S+)\s*$/)
+            if (h) {
+              if (!quiet.has(h[1]) && !(s && s.name === 'test:fetch' && /^test:(webidl|busboy)$/.test(h[1]) && false)) {
+                s = { name: h[1], counts: {}, skips: [], extra: [] }
+                suites.push(s)
+              }
+              continue
+            }
+            if (!s) continue
+            const c = line.trim().match(counters)
+            if (c) { s.counts[c[1]] = Number(c[2]); continue }
+            const sk = line.match(/^\s*(?:\uFE63|\u00ef\u00b9\u00a3)\s(.+?) \([\d.]+m?s\)(?: # (?:SKIP\b\s*)?(.*?))?\s*$/)
+            if (sk && !s.skips.some((x) => x.name === sk[1])) { s.skips.push({ name: sk[1], msg: sk[2] || undefined }); continue }
+            const j = line.match(/^Tests:\s+(.*\btotal)\s*$/)
+            if (j) { s.extra.push(`jest: ${j[1]}`); const p = j[1].match(/(\d+) passed/); const f = j[1].match(/(\d+) failed/); const k = j[1].match(/(\d+) skipped/); s.counts.pass = Number(p?.[1] ?? 0); s.counts.fail = Number(f?.[1] ?? 0); s.counts.skipped = Number(k?.[1] ?? 0); continue }
+            const ct = line.match(/^\s*(Total tests|Passed|Failed|Failed \(optional\)|Setup failed|Skipped):\s+(\d+)/)
+            if (ct && s.name === 'test:cache-tests') { (s.ct ??= []); if (ct[1] === 'Total tests') s.ct.push({}); s.ct.at(-1)[ct[1]] = Number(ct[2]); continue }
+            const w = line.match(/^\S*\s*(Passing|Failing): (\d+)\s*$/)
+            if (w) { s.counts[w[1] === 'Passing' ? 'pass' : 'wptFailing'] = Number(w[2]); continue }
+            if (/^WPT gate: /.test(line) || /^\s+EXCLUDED /.test(line)) { wpt.push(line.trim()); continue }
+          }
+          // ---- report
+          let pass = 0; let fail = 0; let skipped = 0
+          console.log('='.repeat(78))
+          console.log('TEST RESULTS SUMMARY (parsed from this job\'s own test output)')
+          console.log('='.repeat(78))
+          for (const x of suites) {
+            if (x.ct) {
+              const t = x.ct.reduce((a, e) => { for (const [k, v] of Object.entries(e)) a[k] = (a[k] ?? 0) + v; return a }, {})
+              x.counts.pass = t.Passed ?? 0; x.counts.fail = t.Failed ?? 0; x.counts.skipped = t.Skipped ?? 0
+              x.extra.push(`${x.ct.length} cache environments; per environment: ${x.ct.map((e) => `${e.Passed} passed / ${e.Failed} failed / ${e['Failed (optional)']} optional-behaviour checks not met (not asserted) / ${e['Setup failed']} setup failed`).join('; ')}`)
+            }
+            const k = x.counts
+            if (k.pass === undefined && k.fail === undefined) continue
+            pass += k.pass ?? 0; fail += k.fail ?? 0; skipped += k.skipped ?? 0
+            const parts = [`${k.pass ?? 0} passed`, `${k.fail ?? 0} failed`]
+            if (k.skipped !== undefined) parts.push(`${k.skipped} skipped`)
+            if (k.cancelled) parts.push(`${k.cancelled} cancelled`)
+            if (k.wptFailing !== undefined) parts.push(`${k.wptFailing} WPT subtests failing (classified by the WPT gate below)`)
+            console.log(`${x.name.padEnd(28)} ${parts.join(', ')}`)
+            x.extra.forEach((e) => console.log(`${' '.repeat(29)}${e}`))
+          }
+          console.log('-'.repeat(78))
+          console.log(`TOTAL: ${pass} passed, ${fail} failed, ${skipped} skipped`)
+          if (wpt.length) { console.log('\nWeb Platform Tests gate (subtest results compared with upstream expectation.json):'); wpt.forEach((l) => console.log(`  ${l}`)) }
+          const fired = suites.flatMap((x) => x.skips.map((k) => ({ ...k, suite: x.name })))
+          console.log(`\nSkipped tests that actually fired in this job (${fired.length}), with the reason for each:`)
+          for (const k of fired) {
+            const why = siteFor(k.name)
+            console.log(`  [${k.suite}] "${k.name}"${k.msg ? ` — skip message: "${k.msg}"` : ''}`)
+            if (why) why.forEach((w) => console.log(`      reason: ${w}`))
+            else if (!k.msg) console.log('      reason: no skip declaration found under test/ for this name')
+          }
+          if (fail > 0) process.exitCode = 1
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-test-summary.mjs" "$RUNNER_TEMP/seal-test-output.log"
 
   test-without-ssl:
-    name: Test with Node.js ${{ matrix.node-version }} compiled --without-ssl
+    # SEAL: upstream compiles Node.js from source here (./configure --without-ssl),
+    # a 125-148 minute step on a cold ccache (see test-without-intl); the sealing
+    # harness stops waiting after 50 minutes. As the closest runnable stand-in,
+    # upstream's own check (node index.js) runs on the stock Node.js with a
+    # --require preload that makes node:crypto throw ERR_NO_CRYPTO and removes
+    # globalThis.crypto, which is how a --without-ssl build presents itself and
+    # what lib/util/runtime-features.js detects.
+    name: Test with Node.js ${{ matrix.node-version }} with node:crypto unavailable (stand-in for --without-ssl)
     strategy:
       fail-fast: false
       max-parallel: 0
       matrix:
         node-version: ['22', '24', '25', '26']
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -197,38 +1280,23 @@ jobs:
       - name: Build undici
         run: npm run build:node
 
-      - name: Determine latest release
-        id: release
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          result-encoding: string
-          script: |
-            const req = await fetch('https://nodejs.org/download/release/index.json')
-            const releases = await req.json()
-
-            const latest = releases.find((r) => r.version.startsWith('v${{ matrix.node-version }}'))
-            return latest.version
-
-      - name: Download and extract source
-        run: curl https://nodejs.org/download/release/${{ steps.release.outputs.result }}/node-${{ steps.release.outputs.result }}.tar.xz | tar xfJ -
-
-      - name: Install ninja
-        run: sudo apt-get install ninja-build
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 #v1.2.23
-        with:
-          key: node${{ matrix.node-version }}
-
-      - name: Build node
-        working-directory: ./node-${{ steps.release.outputs.result }}
+      - name: Make node:crypto unavailable (stand-in for --without-ssl)
         run: |
-          export CC="ccache gcc"
-          export CXX="ccache g++"
-          ./configure --without-ssl --ninja --prefix=./final
-          make
-          make install
-          echo "$(pwd)/final/bin" >> $GITHUB_PATH
+          cat > "$RUNNER_TEMP/seal-no-crypto.cjs" <<'SEAL_EOF'
+          'use strict'
+          // Make node:crypto unavailable the way a Node.js built --without-ssl does.
+          const Module = require('node:module')
+          const load = Module._load
+          Module._load = function (request) {
+            if (request === 'crypto' || request === 'node:crypto') {
+              const err = new Error('Node.js is not compiled with OpenSSL crypto support')
+              err.code = 'ERR_NO_CRYPTO'
+              throw err
+            }
+            return load.apply(this, arguments)
+          }
+          delete globalThis.crypto
+          SEAL_EOF
 
       - name: Print version information
         run: |
@@ -241,10 +1309,29 @@ jobs:
 
       - name: Try loading Node.js without Crypto
         run: node index.js
+        env:
+          NODE_OPTIONS: --require ${{ runner.temp }}/seal-no-crypto.cjs
+
+      - name: Confirm undici detected crypto as unavailable
+        run: |
+          cat > "$RUNNER_TEMP/seal-crypto-probe.cjs" <<'SEAL_EOF'
+          const root = process.cwd()
+          require(root + '/index.js')
+          const { runtimeFeatures } = require(root + '/lib/util/runtime-features.js')
+          if (runtimeFeatures.has('crypto') !== false || typeof globalThis.crypto !== 'undefined') {
+            console.error('crypto still visible to undici')
+            process.exit(1)
+          }
+          console.log('undici loaded; runtimeFeatures.has(crypto):', runtimeFeatures.has('crypto'), '| typeof globalThis.crypto:', typeof globalThis.crypto)
+          SEAL_EOF
+          node "$RUNNER_TEMP/seal-crypto-probe.cjs"
+        env:
+          NODE_OPTIONS: --require ${{ runner.temp }}/seal-no-crypto.cjs
 
   test-fuzzing:
     name: Fuzzing
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -302,9 +1389,36 @@ jobs:
       - name: Run typings tests
         run: npm run test:typescript
 
+  pack:
+    name: Pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.20.0'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Pack
+        run: npm pack --ignore-scripts
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: undici-tgz
+          path: undici-8.10.2.tgz
+          if-no-files-found: error
+
   automerge:
-    if: >
-      github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    if: false
     needs:
       - dependency-review
       - test
@@ -314,6 +1428,7 @@ jobs:
       - test-fuzzing
       - lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write

@@ -5,6 +5,7 @@ const { test, after } = require('node:test')
 const net = require('node:net')
 const { isIP } = net
 const { lookup } = require('node:dns')
+const { spawnSync } = require('node:child_process')
 const { createServer } = require('node:http')
 const { createServer: createSecureServer } = require('node:https')
 const { once } = require('node:events')
@@ -18,15 +19,16 @@ const { dns, cache, deduplicate } = interceptors
 // Helper to check if IPv6 is available for localhost
 // This is called synchronously at test definition time
 function hasIPv6LocalhostSync () {
-  let ipv6Available = false
-  try {
-    const addresses = lookup.sync('localhost', { all: true, family: 6 })
-    ipv6Available = addresses != null && addresses.length > 0 && addresses.some(addr => addr.family === 6)
-  } catch (err) {
-    // If lookup fails, assume IPv6 is not available
-    ipv6Available = false
-  }
-  return ipv6Available
+  // node:dns has no lookup.sync, so calling it always threw and the IPv6
+  // tests below were skipped everywhere. Resolve localhost over IPv6 and bind
+  // ::1 in a child process instead, which is the same check done synchronously.
+  const probe = 'require("node:dns").lookup("localhost", { all: true, family: 6 }, (err, addresses) => {' +
+    ' if (err || !addresses.some((addr) => addr.family === 6)) return;' +
+    ' const server = require("node:net").createServer();' +
+    ' server.on("error", () => {});' +
+    ' server.listen(0, "::1", () => { process.stdout.write("ipv6"); server.close() }) })'
+  const { stdout } = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', timeout: 10000 })
+  return stdout === 'ipv6'
 }
 
 // Check IPv6 availability once at module load time
